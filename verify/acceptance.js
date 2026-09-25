@@ -4,10 +4,12 @@
 // 一次性验收服务 verify：
 //   1. 复核合法链的逐跳证据（每跳签名、规范载荷摘要、收紧约束、准许结论）；
 //   2. 复核越权链的拒绝（浮标未获上游允许 / 采样量超限 / 约束放宽），定位跳与字段；
-//   3. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
-//   4. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
-//   5. 运行相关代码测试（node --test tests/）与页面构建检查；
-//   6. 启动本机服务做健康地址 API/HTTP 冒烟；GATEWAY_URL 存在时再冒烟对端。
+//   3. 复核主体回环后再次下放的拒绝（B→A 收紧后 A→C 恢复宽范围），
+//      定位首个被放宽字段，且不得存在有效准许结论；
+//   4. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
+//   5. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
+//   6. 运行相关代码测试（node --test tests/）与页面构建检查；
+//   7. 启动本机服务做健康地址 API/HTTP 冒烟；GATEWAY_URL 存在时再冒烟对端。
 //
 // 执行完毕即退出：0 全部通过，1 存在验收失败，2 执行异常。
 
@@ -64,9 +66,40 @@ function resign(value, privateJwk) {
   return canonicalize({ ...payload, sig: sigB64 });
 }
 
+// 主体回环场景（任务给定）：root→A 两个浮标/上限 100；A→B 保持同范围；
+// B→A 收紧为仅 buoy-01/上限 10；A→C 默认恢复两个浮标/上限 100（再次放宽）；
+// 末端由 C 为 buoy-02 签发 50 次采样命令。可用 overrides 调整各跳范围。
+function buildLoopChain({ d2: d2over = {}, d3: d3over = {}, cmd: cmdOver = {} } = {}) {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const c = generateKeyPair();
+  const d0 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, root.privateJwk);
+  const d1 = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, a.privateJwk);
+  const d2s = { nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01'], maxSamples: 10, ...d2over };
+  const d2 = issueDelegation({ iss: b.publicJwk, sub: a.publicJwk, ...d2s }, b.privateJwk);
+  const d3s = { nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01', 'buoy-02'], maxSamples: 100, ...d3over };
+  const d3 = issueDelegation({ iss: a.publicJwk, sub: c.publicJwk, ...d3s }, a.privateJwk);
+  const cmds = { ...d3s, buoy: 'buoy-02', samples: 50, ...cmdOver };
+  const cmd = issueCommand({ iss: c.publicJwk, sub: c.publicJwk, ...cmds }, c.privateJwk);
+  return {
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d0, d1, d2, d3, cmd],
+    now: NOW,
+  };
+}
+
 // ---------- 1) 合法链逐跳证据 ----------
 function sectionValidChain() {
-  console.log('\n[1/6] 合法链逐跳证据复核');
+  console.log('\n[1/7] 合法链逐跳证据复核');
   const root = generateKeyPair();
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -119,7 +152,7 @@ function sectionValidChain() {
 
 // ---------- 2) 越权链 ----------
 function sectionOverPrivileged() {
-  console.log('\n[2/6] 越权链拒绝复核');
+  console.log('\n[2/7] 越权链拒绝复核');
 
   // 2a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
   //     命令请求 buoy-02 → 首个限制跳为末端 hop=1）
@@ -189,9 +222,50 @@ function sectionOverPrivileged() {
   }, 'ISSUER_MISMATCH', 1, '$["iss"]');
 }
 
-// ---------- 3) 篡改签名 / 改写载荷 ----------
+// ---------- 3) 主体回环后再次下放 ----------
+function sectionLoopRedelegation() {
+  console.log('\n[3/7] 主体回环后再次下放（越权应急采样链）拒绝复核');
+
+  // 任务场景完整链：B→A 收紧为 [buoy-01]/10 后，A→C 恢复 [buoy-01,buoy-02]/100，
+  // 末端 C 为 buoy-02 签发 50 次采样命令。所有对象均为各自签发者的有效 P-256
+  // 签名且时间窗有效——必须在 A 再次下放时（hop=3）拒绝，定位首个被放宽字段。
+  const r = verifyChain(buildLoopChain());
+  check('回环后再次下放扩大范围被拒绝（NOT_TIGHTENED, hop=3, field=$["aud"]）',
+    !r.ok && r.error.code === 'NOT_TIGHTENED' && r.error.hop === 3 && r.error.field === '$["aud"]',
+    !r.ok ? `实际=${JSON.stringify(r.error)}` : `意外准许=${JSON.stringify(r.evidence.verdict)}`);
+  check('拒绝响应不含任何有效准许结论（无 evidence / verdict）',
+    !r.ok && r.evidence === undefined && !('verdict' in r));
+
+  // 首个被放宽字段的稳定定位：浮标集合 / 采样上限 / 时间窗（exp / nbf）
+  expectReject('仅放宽采样上限（回环后恢复 100）', buildLoopChain({ d3: { aud: ['buoy-01'] } }),
+    'NOT_TIGHTENED', 3, '$["maxSamples"]');
+  expectReject('仅放宽时间窗 exp（回环后延后）', buildLoopChain({
+    d2: { exp: NOW + 1800 },
+    d3: { aud: ['buoy-01'], maxSamples: 10, exp: NOW + 3600 },
+  }), 'NOT_TIGHTENED', 3, '$["exp"]');
+  expectReject('仅放宽时间窗 nbf（回环后提前）', buildLoopChain({
+    d2: { nbf: NOW - 1800 },
+    d3: { aud: ['buoy-01'], maxSamples: 10, nbf: NOW - 3600 },
+  }), 'NOT_TIGHTENED', 3, '$["nbf"]');
+
+  // 回环本身合法：全程单调收紧的回环链必须照常准许，并给出逐跳证据
+  const okChain = buildLoopChain({
+    d3: { aud: ['buoy-01'], maxSamples: 10 },
+    cmd: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 10 },
+  });
+  const okR = verifyChain(okChain);
+  check('全程单调收紧的回环链仍准许（5 跳证据，最终约束取最紧）',
+    okR.ok && okR.evidence.hops.length === 5
+    && JSON.stringify(okR.evidence.finalConstraints.aud) === '["buoy-01"]'
+    && okR.evidence.finalConstraints.maxSamples === 10
+    && okR.evidence.verdict.allow === true
+    && okR.evidence.verdict.buoy === 'buoy-01' && okR.evidence.verdict.samples === 10,
+    okR.ok ? '' : `实际=${JSON.stringify(okR.error)}`);
+}
+
+// ---------- 4) 篡改签名 / 改写载荷 ----------
 function sectionTamper() {
-  console.log('\n[3/6] 篡改签名与改写载荷拒绝复核');
+  console.log('\n[4/7] 篡改签名与改写载荷拒绝复核');
 
   let c = buildValidChain({ now: NOW });
   let v = parseCanonical(c.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -214,9 +288,9 @@ function sectionTamper() {
   expectReject('签名字段被直接篡改', c, 'BAD_SIGNATURE', 0);
 }
 
-// ---------- 4) 结构性 / 数值错误 ----------
+// ---------- 5) 结构性 / 数值错误 ----------
 function sectionStructural() {
-  console.log('\n[4/6] 结构性与数值错误定位复核');
+  console.log('\n[5/7] 结构性与数值错误定位复核');
   const cases = [
     { name: '重复键', code: 'DUPLICATE_KEY',
       mutate: (t) => t.replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9') },
@@ -244,7 +318,7 @@ function sectionStructural() {
   }
 }
 
-// ---------- 5) 代码测试 / 页面检查 ----------
+// ---------- 6) 代码测试 / 页面检查 ----------
 function run(cmd, args, timeoutMs = 120000) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: rootDir, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -264,7 +338,7 @@ function run(cmd, args, timeoutMs = 120000) {
 }
 
 async function sectionTestsAndPage() {
-  console.log('\n[5/6] 代码测试与页面构建检查');
+  console.log('\n[6/7] 代码测试与页面构建检查');
   const t = await run(process.execPath, ['--test', '--test-concurrency=2', 'tests/']);
   const testCount = (t.out.match(/# tests (\d+)/) || [])[1];
   const passCount = (t.out.match(/# pass (\d+)/) || [])[1];
@@ -275,7 +349,7 @@ async function sectionTestsAndPage() {
   check('页面构建检查通过', pg.code === 0, pg.code === 0 ? '' : (pg.out + pg.err).trim());
 }
 
-// ---------- 6) HTTP 冒烟 ----------
+// ---------- 7) HTTP 冒烟 ----------
 function httpRequest(method, urlPath, { port, host = '127.0.0.1', body, baseUrl } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlPath, baseUrl || `http://${host}:${port}`);
@@ -307,7 +381,7 @@ async function waitForHealth(port, tries = 60) {
 }
 
 async function smokeGateway(label, target) {
-  console.log(`\n[6/6] 健康地址 API/HTTP 冒烟（${label}）`);
+  console.log(`\n[7/7] 健康地址 API/HTTP 冒烟（${label}）`);
 
   const health = await httpRequest('GET', '/health', target);
   const healthJson = JSON.parse(health.body);
@@ -367,12 +441,44 @@ async function smokeGateway(label, target) {
 
   const badReq = await httpRequest('POST', '/api/verify', { ...target, body: 'not-json' });
   check('POST /api/verify 非法请求体 → 400 BAD_REQUEST', badReq.status === 400);
+
+  // 主体回环后再次下放：接口必须拒绝、定位首个被放宽字段，且无有效准许结论
+  const loop = buildLoopChain();
+  const loopResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: loop.rootKeyText, objects: loop.objectTexts, now: loop.now }),
+  });
+  const loopJson = JSON.parse(loopResp.body);
+  check('POST /api/verify 主体回环再次下放 → 422 NOT_TIGHTENED（hop=3, field=$["aud"]）且无准许结论',
+    loopResp.status === 422 && loopJson.ok === false
+    && loopJson.error.code === 'NOT_TIGHTENED' && loopJson.error.hop === 3
+    && loopJson.error.field === '$["aud"]'
+    && loopJson.evidence === undefined && loopJson.verdict === undefined,
+    `status=${loopResp.status} body=${loopResp.body.slice(0, 200)}`);
+
+  // 全程单调收紧的回环链：接口照常准许并返回逐跳证据
+  const loopOk = buildLoopChain({
+    d3: { aud: ['buoy-01'], maxSamples: 10 },
+    cmd: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 10 },
+  });
+  const loopOkResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: loopOk.rootKeyText, objects: loopOk.objectTexts, now: loopOk.now }),
+  });
+  const loopOkJson = JSON.parse(loopOkResp.body);
+  check('POST /api/verify 合法回环链 → 200，5 跳证据且最终约束取最紧',
+    loopOkResp.status === 200 && loopOkJson.ok === true
+    && loopOkJson.evidence?.hops?.length === 5
+    && loopOkJson.evidence.finalConstraints.maxSamples === 10
+    && loopOkJson.evidence.verdict.allow === true,
+    `status=${loopOkResp.status}`);
 }
 
 async function main() {
   console.log('=== verify：受限委托链复核一次性验收 ===');
   sectionValidChain();
   sectionOverPrivileged();
+  sectionLoopRedelegation();
   sectionTamper();
   sectionStructural();
   await sectionTestsAndPage();

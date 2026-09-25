@@ -234,7 +234,6 @@ function verifyChain(input) {
   }
 
   const hops = [];
-  const subjectScopes = new Map();
   for (let i = 0; i < texts.length; i++) {
     const text = texts[i];
     if (typeof text !== 'string' || text.length === 0) {
@@ -288,14 +287,11 @@ function verifyChain(input) {
     }
 
     // 3) 收紧检查（仅允许收紧，定位首个违规字段）
+    //    链是严格线性的（上一步已核验本跳 iss == 上一跳 sub），
+    //    因此始终与紧邻的上一跳比较：即使主体在链中回环（如 B 再委托回 A），
+    //    再次下放时也不得放宽此前任何一跳已收紧的时间窗/浮标集合/采样上限。
     if (i > 0) {
-      const issuerId = jwkThumbprint(model.iss);
-      const parentScope = subjectScopes.get(issuerId);
-      if (!parentScope) {
-        return fail(new ChainError('INTERNAL', i, '$["iss"]',
-          `第 ${i} 跳签发者缺少可用的委托作用域`));
-      }
-      const prev = parentScope.model;
+      const prev = hops[i - 1].model;
       if (model.nbf < prev.nbf) {
         return fail(new ChainError('NOT_TIGHTENED', i, '$["nbf"]',
           `第 ${i} 跳有效期起早于上一跳（${model.nbf} < ${prev.nbf}），时间窗只允许收紧`));
@@ -326,43 +322,36 @@ function verifyChain(input) {
         `第 ${i} 跳已过期（now=${now} > exp=${model.exp}）`));
     }
 
-    const subjectId = jwkThumbprint(model.sub);
-    if (!subjectScopes.has(subjectId)) {
-      subjectScopes.set(subjectId, { model, originHop: i });
-    }
     hops.push({ model, payloadDigest, sig: model.sig });
   }
 
   // ---- 末端命令：浮标须获全部上游允许、采样量不超过任一上限 ----
+  // 逐跳（含回环中已被收紧的每一跳）核对，已签发、已验证的后续命令
+  // 不得掩盖此前任何一跳收紧过的浮标集合或采样上限。
   const last = hops[hops.length - 1].model;
   if (last.typ !== 'command') {
     return fail(new ChainError('SCHEMA', hops.length - 1, '$["typ"]', '链末端必须是 command 对象'));
   }
-  const terminalScopes = [...subjectScopes.values()];
-  if (!terminalScopes.some((scope) => scope.model === last)) {
-    terminalScopes.push({ model: last, originHop: hops.length - 1 });
-  }
-  for (const scope of terminalScopes) {
-    if (!scope.model.aud.includes(last.buoy)) {
-      return fail(new ChainError('BUOY_NOT_ALLOWED', scope.originHop, '$["aud"]',
-        `末端浮标 "${last.buoy}" 未获第 ${scope.originHop} 跳允许（不在该跳 aud 集合内）`));
+  for (let i = 0; i < hops.length; i++) {
+    if (!hops[i].model.aud.includes(last.buoy)) {
+      return fail(new ChainError('BUOY_NOT_ALLOWED', i, '$["aud"]',
+        `末端浮标 "${last.buoy}" 未获第 ${i} 跳允许（不在该跳 aud 集合内）`));
     }
   }
-  for (const scope of terminalScopes) {
-    if (last.samples > scope.model.maxSamples) {
-      return fail(new ChainError('SAMPLES_EXCEEDED', scope.originHop, '$["maxSamples"]',
-        `采样量 ${last.samples} 超过第 ${scope.originHop} 跳采样上限 ${scope.model.maxSamples}`));
+  for (let i = 0; i < hops.length; i++) {
+    if (last.samples > hops[i].model.maxSamples) {
+      return fail(new ChainError('SAMPLES_EXCEEDED', i, '$["maxSamples"]',
+        `采样量 ${last.samples} 超过第 ${i} 跳采样上限 ${hops[i].model.maxSamples}`));
     }
   }
 
-  // ---- 汇总证据 ----
+  // ---- 汇总证据（最终约束 = 全部历史跳的交集） ----
   const hopEvidence = [];
   let finalAud = null;
   let finalNbf = 0;
   let finalExp = LIMITS.INT32_MAX;
   let finalCap = LIMITS.INT32_MAX;
-  for (const scope of terminalScopes) {
-    const m = scope.model;
+  for (const { model: m } of hops) {
     finalAud = finalAud === null ? [...m.aud] : finalAud.filter((b) => m.aud.includes(b));
     finalNbf = Math.max(finalNbf, m.nbf);
     finalExp = Math.min(finalExp, m.exp);

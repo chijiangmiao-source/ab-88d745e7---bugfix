@@ -331,3 +331,117 @@ test('验签使用规范字节：键序被重排（且语义不变）同样导�
   assert.equal(r.ok, false);
   assert.equal(r.error.code, 'KEY_ORDER');
 });
+
+// ---------- 主体回环（B→A 收紧后 A 再次下放） ----------
+
+// root→A [buoy-01,buoy-02]/100；A→B 同范围；B→A 收紧 [buoy-01]/10；
+// A→C 默认恢复 [buoy-01,buoy-02]/100（再次放宽）；C 为 buoy-02 签发 50 次采样命令。
+function loopChain({ d2: d2over = {}, d3: d3over = {}, cmd: cmdOver = {} } = {}) {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const c = generateKeyPair();
+  const d0 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, root.privateJwk);
+  const d1 = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, a.privateJwk);
+  // B 把权限回授给 A，并收紧为仅 buoy-01、上限 10
+  const d2s = { nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01'], maxSamples: 10, ...d2over };
+  const d2 = issueDelegation({ iss: b.publicJwk, sub: a.publicJwk, ...d2s }, b.privateJwk);
+  // A 再次下放给 C（默认恢复宽范围 —— 越权放宽）
+  const d3s = { nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01', 'buoy-02'], maxSamples: 100, ...d3over };
+  const d3 = issueDelegation({ iss: a.publicJwk, sub: c.publicJwk, ...d3s }, a.privateJwk);
+  const cmds = { ...d3s, buoy: 'buoy-02', samples: 50, ...cmdOver };
+  const cmd = issueCommand({ iss: c.publicJwk, sub: c.publicJwk, ...cmds }, c.privateJwk);
+  return {
+    root, a, b, c,
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d0, d1, d2, d3, cmd],
+    now: NOW,
+  };
+}
+
+test('主体回环后再次下放扩大浮标集合：拒绝并定位首个放宽字段 aud（hop=3）', () => {
+  const r = verifyChain(loopChain());
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 3);
+  assert.equal(r.error.field, '$["aud"]');
+  assert.match(r.error.message, /buoy-02/);
+  assert.equal(r.evidence, undefined); // 不得存在有效准许结论
+});
+
+test('主体回环后再次下放扩大采样上限：NOT_TIGHTENED 定位 maxSamples', () => {
+  // 浮标集合保持收紧，仅上限被恢复为 100
+  const r = verifyChain(loopChain({ d3: { aud: ['buoy-01'] } }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 3);
+  assert.equal(r.error.field, '$["maxSamples"]');
+});
+
+test('主体回环后再次下放延后 exp：NOT_TIGHTENED 定位 exp', () => {
+  const r = verifyChain(loopChain({
+    d2: { exp: NOW + 1800 }, // 回环时收紧时间窗
+    d3: { aud: ['buoy-01'], maxSamples: 10, exp: NOW + 3600 }, // 仅放宽 exp
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 3);
+  assert.equal(r.error.field, '$["exp"]');
+});
+
+test('主体回环后再次下放提前 nbf：NOT_TIGHTENED 定位 nbf', () => {
+  const r = verifyChain(loopChain({
+    d2: { nbf: NOW - 1800 }, // 回环时收紧时间窗
+    d3: { aud: ['buoy-01'], maxSamples: 10, nbf: NOW - 3600 }, // 仅提前 nbf
+  }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 3);
+  assert.equal(r.error.field, '$["nbf"]');
+});
+
+test('主体多次回环：收紧以紧邻上一跳为准，而非该主体的首次委托', () => {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const win = { nbf: NOW - 3600, exp: NOW + 3600, aud: ['x'] };
+  const d0 = issueDelegation({ iss: root.publicJwk, sub: a.publicJwk, ...win, maxSamples: 100 }, root.privateJwk);
+  const d1 = issueDelegation({ iss: a.publicJwk, sub: b.publicJwk, ...win, maxSamples: 100 }, a.privateJwk);
+  const d2 = issueDelegation({ iss: b.publicJwk, sub: a.publicJwk, ...win, maxSamples: 50 }, b.privateJwk);
+  // 60 相对 A 的首次委托（100）是收紧，但相对上一跳（50）是放宽
+  const d3 = issueDelegation({ iss: a.publicJwk, sub: b.publicJwk, ...win, maxSamples: 60 }, a.privateJwk);
+  const cmd = issueCommand({ iss: b.publicJwk, sub: b.publicJwk, ...win, maxSamples: 60, buoy: 'x', samples: 60 }, b.privateJwk);
+  const r = verifyChain({ rootKeyText: rootKeyDocument(root.publicJwk), objectTexts: [d0, d1, d2, d3, cmd], now: NOW });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 3);
+  assert.equal(r.error.field, '$["maxSamples"]');
+});
+
+test('主体回环但全程单调收紧：合法，逐跳证据与最终约束正确', () => {
+  const r = verifyChain(loopChain({
+    d3: { aud: ['buoy-01'], maxSamples: 10 }, // 保持收紧后的范围
+    cmd: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 10 },
+  }));
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  const { evidence } = r;
+  assert.equal(evidence.hops.length, 5);
+  // 回环收紧后的约束必须体现在最终结论中
+  assert.deepEqual(evidence.finalConstraints.aud, ['buoy-01']);
+  assert.equal(evidence.finalConstraints.maxSamples, 10);
+  assert.equal(evidence.verdict.allow, true);
+  assert.equal(evidence.verdict.buoy, 'buoy-01');
+  assert.equal(evidence.verdict.samples, 10);
+  for (const h of evidence.hops) {
+    assert.match(h.payloadDigest, /^[0-9a-f]{64}$/);
+    assert.ok(h.signature.length > 0);
+  }
+});
