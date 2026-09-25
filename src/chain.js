@@ -234,7 +234,6 @@ function verifyChain(input) {
   }
 
   const hops = [];
-  const subjectScopes = new Map();
   for (let i = 0; i < texts.length; i++) {
     const text = texts[i];
     if (typeof text !== 'string' || text.length === 0) {
@@ -287,15 +286,13 @@ function verifyChain(input) {
         `第 ${i} 跳委托并非由前一主体签发（iss ≠ 第 ${i - 1} 跳 sub）`));
     }
 
-    // 3) 收紧检查（仅允许收紧，定位首个违规字段）
+    // 3) 收紧检查（相对“上一跳”仅允许收紧，定位首个违规字段）。
+    //    上一跳 sub 已经过签名与签发关系校验、必然等于本跳 iss，因此
+    //    “上一跳约束”即签发本跳时该主体持有的最新授权。主体可能在链中
+    //    回环出现（A→B→A），必须逐跳比较，不能复用该主体早期的更宽作用域，
+    //    否则中途收紧会被旧授权掩盖、再次下放可被悄悄放宽。
     if (i > 0) {
-      const issuerId = jwkThumbprint(model.iss);
-      const parentScope = subjectScopes.get(issuerId);
-      if (!parentScope) {
-        return fail(new ChainError('INTERNAL', i, '$["iss"]',
-          `第 ${i} 跳签发者缺少可用的委托作用域`));
-      }
-      const prev = parentScope.model;
+      const prev = hops[i - 1].model;
       if (model.nbf < prev.nbf) {
         return fail(new ChainError('NOT_TIGHTENED', i, '$["nbf"]',
           `第 ${i} 跳有效期起早于上一跳（${model.nbf} < ${prev.nbf}），时间窗只允许收紧`));
@@ -326,22 +323,17 @@ function verifyChain(input) {
         `第 ${i} 跳已过期（now=${now} > exp=${model.exp}）`));
     }
 
-    const subjectId = jwkThumbprint(model.sub);
-    if (!subjectScopes.has(subjectId)) {
-      subjectScopes.set(subjectId, { model, originHop: i });
-    }
     hops.push({ model, payloadDigest, sig: model.sig });
   }
 
-  // ---- 末端命令：浮标须获全部上游允许、采样量不超过任一上限 ----
+  // ---- 末端命令：浮标须获全部历史委托允许、采样量不超过任一历史上限 ----
   const last = hops[hops.length - 1].model;
   if (last.typ !== 'command') {
     return fail(new ChainError('SCHEMA', hops.length - 1, '$["typ"]', '链末端必须是 command 对象'));
   }
-  const terminalScopes = [...subjectScopes.values()];
-  if (!terminalScopes.some((scope) => scope.model === last)) {
-    terminalScopes.push({ model: last, originHop: hops.length - 1 });
-  }
+  // 逐跳收集全部历史约束（含回环主体的中途收紧），不得按主体去重——
+  // 已签发、已验证的后续命令不能掩盖此前收紧过的浮标集合或采样上限。
+  const terminalScopes = hops.map((h, i) => ({ model: h.model, originHop: i }));
   for (const scope of terminalScopes) {
     if (!scope.model.aud.includes(last.buoy)) {
       return fail(new ChainError('BUOY_NOT_ALLOWED', scope.originHop, '$["aud"]',

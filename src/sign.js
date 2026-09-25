@@ -93,3 +93,41 @@ export function buildValidChain({ now, buoys = ['buoy-01', 'buoy-02'], maxSample
     now: t,
   };
 }
+
+// 构造主体回环链：root -> A -> B -> A -> C -> 末端命令（共 5 跳）。
+// 默认前三跳：root 授予 A 两个浮标/上限 100；A 向 B 保持同样范围；
+// B 向 A 收紧为仅 buoy-01/上限 10。tighten 可覆盖收紧跳参数；
+// redelegate 给出 A 再次下放给 C 的约束；terminal 给出末端命令
+// （nbf/exp 默认 t-1000/t+1000）。供回环越权场景的测试与验收复现。
+export function buildLoopChain({ now, tighten = {}, redelegate, terminal } = {}) {
+  const t = now ?? Math.floor(Date.now() / 1000);
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const c = generateKeyPair();
+  const wide = {
+    nbf: t - 3600, exp: t + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  };
+  const tight = {
+    nbf: t - 3000, exp: t + 3000,
+    aud: ['buoy-01'], maxSamples: 10,
+    ...tighten,
+  };
+  const d1 = issueDelegation({ iss: root.publicJwk, sub: a.publicJwk, ...wide }, root.privateJwk);
+  const d2 = issueDelegation({ iss: a.publicJwk, sub: b.publicJwk, ...wide }, a.privateJwk);
+  const d3 = issueDelegation({ iss: b.publicJwk, sub: a.publicJwk, ...tight }, b.privateJwk);
+  const d4 = issueDelegation({ iss: a.publicJwk, sub: c.publicJwk, ...redelegate }, a.privateJwk);
+  const term = {
+    nbf: t - 1000, exp: t + 1000,
+    aud: redelegate.aud, maxSamples: redelegate.maxSamples,
+    ...terminal,
+  };
+  const cmd = issueCommand({ iss: c.publicJwk, sub: c.publicJwk, ...term }, c.privateJwk);
+  return {
+    root, a, b, c,
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d1, d2, d3, d4, cmd],
+    now: t,
+  };
+}

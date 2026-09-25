@@ -24,6 +24,7 @@ import {
   issueCommand,
   rootKeyDocument,
   buildValidChain,
+  buildLoopChain,
 } from '../src/sign.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -66,7 +67,7 @@ function resign(value, privateJwk) {
 
 // ---------- 1) 合法链逐跳证据 ----------
 function sectionValidChain() {
-  console.log('\n[1/6] 合法链逐跳证据复核');
+  console.log('\n[1/7] 合法链逐跳证据复核');
   const root = generateKeyPair();
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -119,7 +120,7 @@ function sectionValidChain() {
 
 // ---------- 2) 越权链 ----------
 function sectionOverPrivileged() {
-  console.log('\n[2/6] 越权链拒绝复核');
+  console.log('\n[2/7] 越权链拒绝复核');
 
   // 2a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
   //     命令请求 buoy-02 → 首个限制跳为末端 hop=1）
@@ -189,9 +190,134 @@ function sectionOverPrivileged() {
   }, 'ISSUER_MISMATCH', 1, '$["iss"]');
 }
 
+// ---------- 5) 主体回环后再次下放 ----------
+function sectionSubjectLoop() {
+  console.log('\n[5/7] 主体回环与再次下放拒绝复核');
+
+  // 任务中的越权应急采样链：
+  // root→A(两浮标,上限100) → A→B(同范围) → B→A(收紧:仅 buoy-01,上限10)
+  //   → A→C(恢复两浮标,上限100) → C 为 buoy-02 签发 50 次采样。
+  // 正确行为：在 A 再次下放扩大范围的 hop=3 拒绝，首个放宽字段 aud，
+  // 且不得产出任何准许结论。
+  const attack = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3000,
+      aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+    },
+    terminal: { aud: ['buoy-01', 'buoy-02'], maxSamples: 100, buoy: 'buoy-02', samples: 50 },
+  });
+  const r = verifyChain(attack);
+  check('回环越权链被拒绝（接口语义）', !r.ok, r.ok ? '意外准许' : '');
+  if (!r.ok) {
+    check('拒绝码 NOT_TIGHTENED 且定位 hop=3（A 再次下放）',
+      r.error.code === 'NOT_TIGHTENED' && r.error.hop === 3,
+      `实际 code=${r.error.code}, hop=${r.error.hop}`);
+    check('首个被放宽限制字段定位为 $["aud"]',
+      r.error.field === '$["aud"]', `实际 field=${r.error.field}`);
+    check('拒绝信息指出新增浮标 buoy-02', /buoy-02/.test(r.error.message || ''));
+  }
+  check('拒绝结果不含任何准许证据或最终结论',
+    r.evidence === undefined && !(r.ok === true),
+    `实际=${JSON.stringify(r).slice(0, 160)}`);
+
+  // 仅放宽采样上限（浮标集合保持收紧）→ 首个放宽字段 maxSamples
+  let c = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3000,
+      aud: ['buoy-01'], maxSamples: 100,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 100, buoy: 'buoy-01', samples: 50 },
+  });
+  expectReject('回环后采样上限被放宽', c, 'NOT_TIGHTENED', 3, '$["maxSamples"]');
+
+  // 时间窗放宽：exp 延后
+  c = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3600,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 1 },
+  });
+  expectReject('回环后有效期止被放宽', c, 'NOT_TIGHTENED', 3, '$["exp"]');
+
+  // 时间窗放宽：nbf 提前
+  c = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3600, exp: NOW + 3000,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 1 },
+  });
+  expectReject('回环后有效期起被放宽', c, 'NOT_TIGHTENED', 3, '$["nbf"]');
+
+  // 合法回环链：收紧后继续收紧，应准许并展示 5 跳证据
+  const legal = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 2000, exp: NOW + 2000,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { nbf: NOW - 1000, exp: NOW + 1000, aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 10 },
+  });
+  const lr = verifyChain(legal);
+  check('合法回环链准许（5 跳逐跳证据）',
+    lr.ok && lr.evidence.hops.length === 5,
+    lr.ok ? `hops=${lr.evidence.hops.length}` : JSON.stringify(lr.error));
+  if (lr.ok) {
+    check('合法回环链每跳签名/规范载荷摘要齐备',
+      lr.evidence.hops.every((h) => /^[A-Za-z0-9_-]{86}$/.test(h.signature)
+        && /^[0-9a-f]{64}$/.test(h.payloadDigest)));
+    check('合法回环链最终约束保留收紧结果（aud=[buoy-01], 上限 10）',
+      JSON.stringify(lr.evidence.finalConstraints.aud) === '["buoy-01"]'
+      && lr.evidence.finalConstraints.maxSamples === 10);
+  }
+
+  // 中途收紧的上限不能被旧授权掩盖：命令请求 11 次，首个限制跳为收紧跳 hop=2
+  c = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3000,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 11 },
+  });
+  expectReject('回环收紧的采样上限约束末端命令', c, 'SAMPLES_EXCEEDED', 2, '$["maxSamples"]');
+
+  // 中途收紧的浮标集合不能被旧授权掩盖：命令指向 buoy-02，首个限制跳为收紧跳 hop=2
+  c = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3000,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-02', samples: 1 },
+  });
+  expectReject('回环收紧的浮标集合约束末端命令', c, 'BUOY_NOT_ALLOWED', 2, '$["aud"]');
+
+  // 回环链中签名篡改不得退化：篡改 B→A 收紧跳（hop=2）签名 → BAD_SIGNATURE
+  const tam = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 2000, exp: NOW + 2000,
+      aud: ['buoy-01'], maxSamples: 10,
+    },
+    terminal: { aud: ['buoy-01'], maxSamples: 10, buoy: 'buoy-01', samples: 1 },
+  });
+  const tv = parseCanonical(tam.objectTexts[2], { requireOrderedKeys: false }).value;
+  const sigBuf = Buffer.from(tv.sig.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  sigBuf[0] ^= 0x01;
+  tv.sig = sigBuf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  tam.objectTexts[2] = canonicalize(tv);
+  expectReject('回环链中途收紧跳签名被篡改', tam, 'BAD_SIGNATURE', 2);
+}
+
 // ---------- 3) 篡改签名 / 改写载荷 ----------
 function sectionTamper() {
-  console.log('\n[3/6] 篡改签名与改写载荷拒绝复核');
+  console.log('\n[3/7] 篡改签名与改写载荷拒绝复核');
 
   let c = buildValidChain({ now: NOW });
   let v = parseCanonical(c.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -216,7 +342,7 @@ function sectionTamper() {
 
 // ---------- 4) 结构性 / 数值错误 ----------
 function sectionStructural() {
-  console.log('\n[4/6] 结构性与数值错误定位复核');
+  console.log('\n[4/7] 结构性与数值错误定位复核');
   const cases = [
     { name: '重复键', code: 'DUPLICATE_KEY',
       mutate: (t) => t.replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9') },
@@ -264,7 +390,7 @@ function run(cmd, args, timeoutMs = 120000) {
 }
 
 async function sectionTestsAndPage() {
-  console.log('\n[5/6] 代码测试与页面构建检查');
+  console.log('\n[6/7] 代码测试与页面构建检查');
   const t = await run(process.execPath, ['--test', '--test-concurrency=2', 'tests/']);
   const testCount = (t.out.match(/# tests (\d+)/) || [])[1];
   const passCount = (t.out.match(/# pass (\d+)/) || [])[1];
@@ -307,7 +433,7 @@ async function waitForHealth(port, tries = 60) {
 }
 
 async function smokeGateway(label, target) {
-  console.log(`\n[6/6] 健康地址 API/HTTP 冒烟（${label}）`);
+  console.log(`\n[7/7] 健康地址 API/HTTP 冒烟（${label}）`);
 
   const health = await httpRequest('GET', '/health', target);
   const healthJson = JSON.parse(health.body);
@@ -339,6 +465,26 @@ async function smokeGateway(label, target) {
     expResp.status === 422 && expJson.ok === false
     && expJson.error.code === 'TIME_EXPIRED' && expJson.error.hop !== null,
     `status=${expResp.status}`);
+
+  // 主体回环越权链经接口提交：422 拒绝、hop=3、首个放宽字段 aud、无准许结论
+  const loop = buildLoopChain({
+    now: NOW,
+    redelegate: {
+      nbf: NOW - 3000, exp: NOW + 3000,
+      aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+    },
+    terminal: { aud: ['buoy-01', 'buoy-02'], maxSamples: 100, buoy: 'buoy-02', samples: 50 },
+  });
+  const loopResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: loop.rootKeyText, objects: loop.objectTexts, now: loop.now }),
+  });
+  const loopJson = JSON.parse(loopResp.body);
+  check('POST /api/verify 主体回环再次下放 → 422 NOT_TIGHTENED（hop=3, field=aud，无准许结论）',
+    loopResp.status === 422 && loopJson.ok === false
+    && loopJson.error?.code === 'NOT_TIGHTENED' && loopJson.error.hop === 3
+    && loopJson.error.field === '$["aud"]' && loopJson.evidence === undefined,
+    `status=${loopResp.status}, body=${loopResp.body.slice(0, 200)}`);
 
   const tampered = buildValidChain({ now: Math.floor(Date.now() / 1000) });
   const pv = parseCanonical(tampered.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -375,6 +521,7 @@ async function main() {
   sectionOverPrivileged();
   sectionTamper();
   sectionStructural();
+  sectionSubjectLoop();
   await sectionTestsAndPage();
 
   const port = Number(process.env.VERIFY_PORT || 18080);
